@@ -1,0 +1,192 @@
+name: Dependabot Autofix
+
+on:
+  # Trigger when a workflow run completes on a PR
+  workflow_run:
+    workflows: ["Test", "Check dist/"]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  issues: write
+  checks: read
+  contents: read
+  actions: read
+
+jobs:
+  check-and-assign:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Get PR information
+        id: pr-info
+        run: |
+          # Get the PR associated with this workflow run
+          PR_DATA=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ github.repository }}/pulls?head=${{ github.repository_owner }}:${{ github.event.workflow_run.head_branch }}&state=open")
+          
+          PR_NUMBER=$(echo "$PR_DATA" | jq -r '.[0].number // empty')
+          PR_USER=$(echo "$PR_DATA" | jq -r '.[0].user.login // empty')
+          
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No open PR found for this workflow run"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Only process Dependabot PRs
+          if [ "$PR_USER" != "dependabot[bot]" ]; then
+            echo "PR is not from Dependabot, skipping"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "skip=false" >> $GITHUB_OUTPUT
+          echo "Found Dependabot PR #$PR_NUMBER"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check workflow run status
+        if: steps.pr-info.outputs.skip != 'true'
+        id: check-status
+        run: |
+          WORKFLOW_STATUS="${{ github.event.workflow_run.conclusion }}"
+          echo "Workflow conclusion: $WORKFLOW_STATUS"
+          
+          if [ "$WORKFLOW_STATUS" = "failure" ]; then
+            echo "workflow_failed=true" >> $GITHUB_OUTPUT
+          else
+            echo "workflow_failed=false" >> $GITHUB_OUTPUT
+            echo "Workflow succeeded, no action needed"
+          fi
+
+      - name: Get all check runs for the PR
+        if: steps.pr-info.outputs.skip != 'true' && steps.check-status.outputs.workflow_failed == 'true'
+        id: check-runs
+        run: |
+          PR_NUMBER=${{ steps.pr-info.outputs.pr_number }}
+          
+          # Get the PR's head SHA
+          HEAD_SHA=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ github.repository }}/pulls/$PR_NUMBER" \
+            --jq '.head.sha')
+          
+          echo "HEAD_SHA: $HEAD_SHA"
+          
+          # Get all check runs for this commit
+          CHECK_RUNS=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ github.repository }}/commits/$HEAD_SHA/check-runs")
+          
+          # Get failed checks
+          FAILED_CHECKS=$(echo "$CHECK_RUNS" | jq '[.check_runs[] | select(.conclusion == "failure") | {name: .name, conclusion: .conclusion, html_url: .html_url, output: .output}]')
+          FAILED_COUNT=$(echo "$FAILED_CHECKS" | jq 'length')
+          
+          echo "Failed checks count: $FAILED_COUNT"
+          
+          if [ "$FAILED_COUNT" -eq 0 ]; then
+            echo "No failed checks found"
+            echo "has_failures=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_failures=true" >> $GITHUB_OUTPUT
+            echo "failed_count=$FAILED_COUNT" >> $GITHUB_OUTPUT
+            echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+            
+            # Save failed checks details
+            echo "failed_checks<<EOF" >> $GITHUB_OUTPUT
+            echo "$FAILED_CHECKS" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare failure details
+        if: steps.pr-info.outputs.skip != 'true' && steps.check-runs.outputs.has_failures == 'true'
+        id: prepare-details
+        run: |
+          FAILED_CHECKS='${{ steps.check-runs.outputs.failed_checks }}'
+          
+          echo "Preparing failure details..."
+          
+          # Build a detailed failure report
+          FAILURE_REPORT="## CI Failures Detected\n\n"
+          FAILURE_REPORT="${FAILURE_REPORT}The following checks have failed:\n\n"
+          
+          # Process each failed check
+          echo "$FAILED_CHECKS" | jq -c '.[]' | while IFS= read -r check; do
+            CHECK_NAME=$(echo "$check" | jq -r '.name')
+            CHECK_URL=$(echo "$check" | jq -r '.html_url')
+            CHECK_TITLE=$(echo "$check" | jq -r '.output.title // "No title"')
+            CHECK_SUMMARY=$(echo "$check" | jq -r '.output.summary // "No summary available"')
+            
+            FAILURE_REPORT="${FAILURE_REPORT}### ❌ ${CHECK_NAME}\n"
+            FAILURE_REPORT="${FAILURE_REPORT}**Title:** ${CHECK_TITLE}\n"
+            FAILURE_REPORT="${FAILURE_REPORT}**URL:** ${CHECK_URL}\n"
+            FAILURE_REPORT="${FAILURE_REPORT}**Summary:**\n\`\`\`\n${CHECK_SUMMARY}\n\`\`\`\n\n"
+          done
+          
+          # Save the report
+          {
+            echo "failure_report<<EOFMARKER"
+            echo -e "$FAILURE_REPORT"
+            echo "EOFMARKER"
+          } >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assign to GitHub Copilot
+        if: steps.pr-info.outputs.skip != 'true' && steps.check-runs.outputs.has_failures == 'true'
+        run: |
+          PR_NUMBER=${{ steps.pr-info.outputs.pr_number }}
+          
+          # Prepare instructions for Copilot
+          COPILOT_INSTRUCTIONS="This Dependabot PR has failed CI checks. Please investigate and fix the failures.
+
+          ${{ steps.prepare-details.outputs.failure_report }}
+
+          ## Summary
+          - Total failed checks: ${{ steps.check-runs.outputs.failed_count }}
+          - Commit SHA: ${{ steps.check-runs.outputs.head_sha }}
+          - Triggered by workflow: ${{ github.event.workflow_run.name }}
+
+          Please:
+          1. Review the failed check outputs above
+          2. Analyze what caused the failures
+          3. Make the necessary code changes to fix the issues
+          4. Ensure all CI checks pass after your changes"
+          
+          # Use gh issue edit to add instructions and assign to Copilot
+          # Note: The exact assignment method depends on GitHub Copilot's API
+          # This follows the pattern from the GitHub documentation
+          gh issue edit $PR_NUMBER \
+            --add-label "copilot-autofix" \
+            --body "$(gh pr view $PR_NUMBER --json body -q .body)
+
+          ---
+
+          ## 🤖 GitHub Copilot Auto-Assignment
+
+          @github-copilot please help fix the CI failures in this PR.
+
+          $COPILOT_INSTRUCTIONS"
+          
+          echo "✅ Updated PR #${PR_NUMBER} with Copilot assignment and failure details"
+          
+          # Also add a comment to make it more visible
+          gh pr comment $PR_NUMBER --body "🤖 **Copilot Auto-Fix Triggered**
+
+          CI checks have failed on this Dependabot PR. GitHub Copilot has been notified to help fix the issues.
+
+          $COPILOT_INSTRUCTIONS"
+          
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
