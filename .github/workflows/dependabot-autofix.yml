@@ -146,47 +146,65 @@ jobs:
       - name: Assign to GitHub Copilot
         if: steps.pr-info.outputs.skip != 'true' && steps.check-runs.outputs.has_failures == 'true'
         run: |
-          PR_NUMBER=${{ steps.pr-info.outputs.pr_number }}
+          PR_NUMBER="${{ steps.pr-info.outputs.pr_number }}"
           
-          # Prepare instructions for Copilot
-          COPILOT_INSTRUCTIONS="This Dependabot PR has failed CI checks. Please investigate and fix the failures.
-
+          # Create a temporary file for the instructions to avoid quoting issues
+          cat > /tmp/copilot-instructions.txt << 'INSTRUCTIONS_EOF'
+          This Dependabot PR has failed CI checks. Please investigate and fix the failures.
+          
           ${{ steps.prepare-details.outputs.failure_report }}
-
+          
           ## Summary
           - Total failed checks: ${{ steps.check-runs.outputs.failed_count }}
           - Commit SHA: ${{ steps.check-runs.outputs.head_sha }}
           - Triggered by workflow: ${{ github.event.workflow_run.name }}
-
+          
           Please:
           1. Review the failed check outputs above
           2. Analyze what caused the failures
           3. Make the necessary code changes to fix the issues
-          4. Ensure all CI checks pass after your changes"
+          4. Ensure all CI checks pass after your changes
+          INSTRUCTIONS_EOF
+          
+          COPILOT_INSTRUCTIONS=$(cat /tmp/copilot-instructions.txt)
+          
+          # Get current PR body and append Copilot assignment
+          CURRENT_BODY=$(gh pr view "$PR_NUMBER" --json body -q .body)
+          
+          # Create new body file
+          {
+            echo "$CURRENT_BODY"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 🤖 GitHub Copilot Auto-Assignment"
+            echo ""
+            echo "@github-copilot please help fix the CI failures in this PR."
+            echo ""
+            cat /tmp/copilot-instructions.txt
+          } > /tmp/new-pr-body.txt
           
           # Use gh issue edit to add instructions and assign to Copilot
-          # Note: The exact assignment method depends on GitHub Copilot's API
-          # This follows the pattern from the GitHub documentation
-          gh issue edit $PR_NUMBER \
+          # See: https://docs.github.com/en/copilot/how-tos/use-copilot-agents/coding-agent/create-a-pr#assigning-an-issue-to-copilot-via-the-github-api
+          gh issue edit "$PR_NUMBER" \
             --add-label "copilot-autofix" \
-            --body "$(gh pr view $PR_NUMBER --json body -q .body)
-
-          ---
-
-          ## 🤖 GitHub Copilot Auto-Assignment
-
-          @github-copilot please help fix the CI failures in this PR.
-
-          $COPILOT_INSTRUCTIONS"
+            --body-file /tmp/new-pr-body.txt
           
           echo "✅ Updated PR #${PR_NUMBER} with Copilot assignment and failure details"
           
           # Also add a comment to make it more visible
-          gh pr comment $PR_NUMBER --body "🤖 **Copilot Auto-Fix Triggered**
-
-          CI checks have failed on this Dependabot PR. GitHub Copilot has been notified to help fix the issues.
-
-          $COPILOT_INSTRUCTIONS"
+          {
+            echo "🤖 **Copilot Auto-Fix Triggered**"
+            echo ""
+            echo "CI checks have failed on this Dependabot PR. GitHub Copilot has been notified to help fix the issues."
+            echo ""
+            cat /tmp/copilot-instructions.txt
+          } > /tmp/pr-comment.txt
+          
+          gh pr comment "$PR_NUMBER" --body-file /tmp/pr-comment.txt
+          
+          # Clean up temp files
+          rm -f /tmp/copilot-instructions.txt /tmp/new-pr-body.txt /tmp/pr-comment.txt
           
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
