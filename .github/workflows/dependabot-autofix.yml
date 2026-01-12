@@ -118,26 +118,26 @@ jobs:
           echo "Preparing failure details..."
           
           # Build a detailed failure report
-          FAILURE_REPORT="## CI Failures Detected\n\n"
-          FAILURE_REPORT="${FAILURE_REPORT}The following checks have failed:\n\n"
+          FAILURE_REPORT="## CI Failures Detected"$'\n\n'
+          FAILURE_REPORT="${FAILURE_REPORT}The following checks have failed:"$'\n\n'
           
-          # Process each failed check
-          echo "$FAILED_CHECKS" | jq -c '.[]' | while IFS= read -r check; do
+          # Process each failed check using process substitution to avoid subshell
+          while IFS= read -r check; do
             CHECK_NAME=$(echo "$check" | jq -r '.name')
             CHECK_URL=$(echo "$check" | jq -r '.html_url')
             CHECK_TITLE=$(echo "$check" | jq -r '.output.title // "No title"')
             CHECK_SUMMARY=$(echo "$check" | jq -r '.output.summary // "No summary available"')
             
-            FAILURE_REPORT="${FAILURE_REPORT}### ❌ ${CHECK_NAME}\n"
-            FAILURE_REPORT="${FAILURE_REPORT}**Title:** ${CHECK_TITLE}\n"
-            FAILURE_REPORT="${FAILURE_REPORT}**URL:** ${CHECK_URL}\n"
-            FAILURE_REPORT="${FAILURE_REPORT}**Summary:**\n\`\`\`\n${CHECK_SUMMARY}\n\`\`\`\n\n"
-          done
+            FAILURE_REPORT="${FAILURE_REPORT}### ❌ ${CHECK_NAME}"$'\n'
+            FAILURE_REPORT="${FAILURE_REPORT}**Title:** ${CHECK_TITLE}"$'\n'
+            FAILURE_REPORT="${FAILURE_REPORT}**URL:** ${CHECK_URL}"$'\n'
+            FAILURE_REPORT="${FAILURE_REPORT}**Summary:**"$'\n'"${CHECK_SUMMARY}"$'\n\n'
+          done < <(echo "$FAILED_CHECKS" | jq -c '.[]')
           
           # Save the report
           {
             echo "failure_report<<EOFMARKER"
-            echo -e "$FAILURE_REPORT"
+            echo "$FAILURE_REPORT"
             echo "EOFMARKER"
           } >> $GITHUB_OUTPUT
         env:
